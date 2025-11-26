@@ -11,7 +11,7 @@ warnings.filterwarnings('ignore')
 # --- APP CONFIGURATION ---
 st.set_page_config(page_title="MEE Graph Tool", page_icon="📈", layout="centered")
 
-st.title("📈 MEE CT Report Generator")
+st.title("📈 CT Report Generator")
 st.markdown("""
 **Instructions:**
 1. Upload your daily report Excel file.
@@ -179,4 +179,5 @@ if uploaded_file is not None:
                     file_name="MEE_Final_Report.pdf",
                     mime="application/pdf",
                     use_container_width=True
+
                 )
