@@ -11,22 +11,22 @@ warnings.filterwarnings('ignore')
 # --- APP CONFIGURATION ---
 st.set_page_config(page_title="MEE Graph Tool", page_icon="📈", layout="centered")
 
-st.title("📈 CT Report Generator")
+st.title("📈 Smart CT Report Generator")
 st.markdown("""
 **Instructions:**
 1. Upload your daily report Excel/CSV file.
-2. **Review the Data Quality Analysis** below to spot missing dates or values.
-3. Download the professional PDF report.
+2. The system will **Detect Limits**, **Check Dates**, and **Flag Violations**.
+3. Review the **Smart Analysis** dashboard below.
+4. Download the PDF report.
 """)
 st.divider()
 
 # --- LOGIC FUNCTIONS ---
 def parse_limit_string(limit_str):
     if not isinstance(limit_str, str): return None, None
-    # normalize dashes and spaces
     clean = limit_str.strip().lower().replace("–", "-").replace("to", "-")
     
-    # Range: "7.0-8.0" or "6 to 10"
+    # Range: "7.0-8.0"
     range_match = re.search(r'(\d+\.?\d*)\s*-\s*(\d+\.?\d*)', clean)
     if range_match: return float(range_match.group(1)), float(range_match.group(2))
     
@@ -41,71 +41,84 @@ def parse_limit_string(limit_str):
     return None, None
 
 def analyze_data_quality(df):
-    """
-    Analyzes the dataframe for missing daily records and missing parameter values.
-    """
     report = {
         'date_gaps': [],
         'missing_values': {},
-        'total_days': 0,
         'date_range': (None, None)
     }
+    if df.empty or 'DATE' not in df.columns: return report
 
-    if df.empty or 'DATE' not in df.columns:
-        return report
-
-    # 1. Date Sequence Analysis
     df = df.sort_values('DATE')
-    min_date = df['DATE'].min()
-    max_date = df['DATE'].max()
+    min_date, max_date = df['DATE'].min(), df['DATE'].max()
     report['date_range'] = (min_date, max_date)
     
-    # Create a full range of daily dates expected
     full_range = pd.date_range(start=min_date, end=max_date, freq='D')
-    report['total_days'] = len(full_range)
-    
-    # Identify dates present in the file
     existing_dates = set(df['DATE'].dt.date)
     
-    # Find gaps
     for date in full_range:
         if date.date() not in existing_dates:
             report['date_gaps'].append(date.date())
 
-    # 2. Parameter Data Analysis
-    # Check each column (except DATE) for missing or non-numeric values
     for col in df.columns:
         if col == 'DATE': continue
-        
-        # Convert to numeric, forcing errors to NaN (this handles '-', 'Nil', empty, etc.)
         numeric_series = pd.to_numeric(df[col], errors='coerce')
-        missing_count = numeric_series.isna().sum()
-        
-        if missing_count > 0:
-            report['missing_values'][col] = missing_count
+        if numeric_series.isna().sum() > 0:
+            report['missing_values'][col] = numeric_series.isna().sum()
 
     return report
 
+def check_limit_violations(df, limits):
+    violations = []
+    
+    for col in df.columns:
+        if col not in limits or col == 'DATE': continue
+        
+        mn, mx = limits[col]['min'], limits[col]['max']
+        series = pd.to_numeric(df[col], errors='coerce')
+        
+        # Check Max Violation
+        if mx is not None:
+            over = df[series > mx]
+            for _, row in over.iterrows():
+                violations.append({
+                    "Date": row['DATE'].strftime('%d-%b-%Y'),
+                    "Parameter": col,
+                    "Value": row[col],
+                    "Limit": f"Max {mx}",
+                    "Status": "High 🔴"
+                })
+
+        # Check Min Violation
+        if mn is not None:
+            under = df[series < mn]
+            for _, row in under.iterrows():
+                violations.append({
+                    "Date": row['DATE'].strftime('%d-%b-%Y'),
+                    "Parameter": col,
+                    "Value": row[col],
+                    "Limit": f"Min {mn}",
+                    "Status": "Low 🔵"
+                })
+                
+    return pd.DataFrame(violations)
+
 def process_file(uploaded_file):
     try:
-        # Load File
         if uploaded_file.name.endswith('.csv'):
             raw = pd.read_csv(uploaded_file, header=None)
         else:
             raw = pd.read_excel(uploaded_file, header=None)
             
-        # Detect Header
-        # Look for a row containing typical keywords
+        # 1. Header Detection
         header_idx = 0
-        keywords = ['parameters', 'date', 'ph', 'tds', 'hardness', 'alkalinity']
+        keywords = ['parameters', 'date', 'ph', 'tds', 'hardness']
         for i in range(min(15, len(raw))):
             row_str = raw.iloc[i].astype(str).str.lower().tolist()
-            # If at least 2 keywords match in this row, assume it's the header
             if sum(1 for k in keywords if any(k in s for s in row_str)) >= 2:
                 header_idx = i
                 break
         
-        # Detect Limits (row usually labeled "CONTROL LIMIT")
+        # 2. Limit Detection
         extracted_limits = {}
         limit_idx = None
         for i in range(min(20, len(raw))):
@@ -121,7 +134,7 @@ def process_file(uploaded_file):
                 if mn is not None or mx is not None:
                     extracted_limits[str(col).strip()] = {'min': mn, 'max': mx}
 
-        # Reload Data with correct header
+        # 3. Load Data
         if uploaded_file.name.endswith('.csv'):
             uploaded_file.seek(0)
             df = pd.read_csv(uploaded_file, header=header_idx)
@@ -129,10 +142,9 @@ def process_file(uploaded_file):
             uploaded_file.seek(0)
             df = pd.read_excel(uploaded_file, header=header_idx)
 
-        # Clean Column Names
         df.columns = [str(c).strip() for c in df.columns]
 
-        # Identify Date Column
+        # 4. Date Cleaning
         date_col = df.columns[0]
         for c in df.columns:
             if 'date' in c.lower() or 'parameters' in c.lower():
@@ -140,32 +152,20 @@ def process_file(uploaded_file):
                 break
         
         df.rename(columns={date_col: 'DATE'}, inplace=True)
-        
-        # Convert Dates and Clean Invalid Rows (metadata, units, empty lines)
         df['DATE'] = pd.to_datetime(df['DATE'], errors='coerce')
         df = df.dropna(subset=['DATE']).sort_values('DATE')
-        
         return df, extracted_limits
 
     except Exception as e:
-        st.error(f"Error reading file. Please make sure it is a standard MEE CT file. Error: {e}")
+        st.error(f"Error: {e}")
         return None, None
 
 def generate_pdf(df, limits):
-    output_pdf = "Report.pdf"
-    
-    # Filter Valid Numeric Columns for Plotting
-    valid_cols = []
-    for col in df.columns:
-        if col == 'DATE': continue
-        if not pd.to_numeric(df[col], errors='coerce').dropna().empty:
-            valid_cols.append(col)
+    output_pdf = "Smart_Report.pdf"
+    valid_cols = [c for c in df.columns if c != 'DATE' and not pd.to_numeric(df[c], errors='coerce').dropna().empty]
 
-    if not valid_cols:
-        st.warning("File loaded, but no numeric data found to plot.")
-        return None
+    if not valid_cols: return None
 
-    # Generate PDF
     with PdfPages(output_pdf) as pdf:
         chunks = [valid_cols[i:i+3] for i in range(0, len(valid_cols), 3)]
 
@@ -178,36 +178,19 @@ def generate_pdf(df, limits):
                 ax = axes[i]
                 series = pd.to_numeric(df[col], errors='coerce')
                 plot_data = pd.DataFrame({'DATE': df['DATE'], 'VAL': series}).dropna()
-
                 lim = limits.get(col, {'min': None, 'max': None})
                 mn, mx = lim['min'], lim['max']
 
-                # Plot
-                ax.plot(plot_data['DATE'], plot_data['VAL'], marker='o', linestyle='-', color='#1f77b4', linewidth=1.5, label='Data')
+                ax.plot(plot_data['DATE'], plot_data['VAL'], marker='o', color='#1f77b4', linewidth=1.5, label='Data')
+                if mn is not None: ax.axhline(mn, color='red', linestyle='--', label=f'Min {mn}')
+                if mx is not None: ax.axhline(mx, color='green', linestyle='--', label=f'Max {mx}')
                 
-                # Limits
-                if mn is not None: ax.axhline(mn, color='red', linestyle='--', linewidth=1.5, label=f'Min ({mn})')
-                if mx is not None: ax.axhline(mx, color='green', linestyle='--', linewidth=1.5, label=f'Max ({mx})')
-                
-                # Style
                 lim_text = f"({mn} - {mx})" if (mn or mx) else ""
-                ax.set_title(f"{col} {lim_text}", fontsize=11, fontweight='bold', pad=15)
+                ax.set_title(f"{col} {lim_text}", fontsize=12, fontweight='bold', pad=10)
                 ax.grid(True, linestyle=':', alpha=0.6)
-                ax.legend(loc='upper right', fontsize=8)
-
-                # Format X-Axis
+                ax.legend(loc='upper right')
                 ax.xaxis.set_major_formatter(mdates.DateFormatter('%d-%b'))
-                ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=12))
                 plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
-                
-                # Dynamic Y-Axis Scaling
-                if not plot_data.empty:
-                    vals = plot_data['VAL']
-                    v_min = min(vals.min(), mn) if mn is not None else vals.min()
-                    v_max = max(vals.max(), mx) if mx is not None else vals.max()
-                    pad = (v_max - v_min) * 0.20
-                    if pad == 0: pad = 1.0
-                    ax.set_ylim(v_min - pad, v_max + pad)
 
             if len(chunk) < 3:
                 for k in range(len(chunk), 3): axes[k].axis('off')
@@ -219,64 +202,72 @@ def generate_pdf(df, limits):
     return output_pdf
 
 # --- MAIN INTERFACE ---
-uploaded_file = st.file_uploader("📂 Choose your file", type=['xlsx', 'csv'])
+uploaded_file = st.file_uploader("📂 Upload CT Report File", type=['xlsx', 'csv'])
 
 if uploaded_file is not None:
-    # 1. Process File
-    with st.spinner('Reading file...'):
+    with st.spinner('Analyzing Data...'):
         df, limits = process_file(uploaded_file)
 
     if df is not None and not df.empty:
-        # 2. Analyze Data Quality
+        # Run Analyses
         quality = analyze_data_quality(df)
-        
-        st.subheader("🧐 Data Quality Analysis")
-        
-        # Layout: Columns for Dates vs Data
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("#### 📅 Date Coverage")
-            start_str = quality['date_range'][0].strftime('%d-%b-%Y')
-            end_str = quality['date_range'][1].strftime('%d-%b-%Y')
-            st.info(f"**Range:** {start_str} to {end_str}")
-            
-            if quality['date_gaps']:
-                st.error(f"**Missing Dates Detected ({len(quality['date_gaps'])}):**")
-                # Show list of missing dates
-                gap_df = pd.DataFrame({'Missing Dates': quality['date_gaps']})
-                st.dataframe(gap_df, height=150, hide_index=True)
-            else:
-                st.success("✅ No missing dates (Sequence is complete).")
+        violations_df = check_limit_violations(df, limits)
 
-        with col2:
-            st.markdown("#### 🧪 Data Integrity")
-            if quality['missing_values']:
-                st.warning(f"**Missing Data in {len(quality['missing_values'])} Parameters:**")
-                st.caption("Count of missing/empty entries per parameter:")
-                # Create a clean little table for missing values
-                miss_df = pd.DataFrame(list(quality['missing_values'].items()), columns=['Parameter', 'Missing Count'])
-                st.dataframe(miss_df, height=150, hide_index=True)
+        # --- DASHBOARD UI ---
+        st.subheader("📊 Smart Analysis Dashboard")
+        
+        # 1. Summary Metrics
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric("Total Days Found", len(df))
+        with m2:
+            st.metric("Missing Dates", len(quality['date_gaps']), delta_color="inverse")
+        with m3:
+            v_count = len(violations_df)
+            st.metric("Limit Violations", v_count, delta_color="inverse" if v_count > 0 else "normal")
+
+        # 2. Limit Violations Section
+        if not violations_df.empty:
+            st.error(f"⚠️ **Attention Needed:** {v_count} parameters crossed their limits.")
+            
+            # Find worst offender
+            worst_param = violations_df['Parameter'].mode()[0]
+            worst_count = violations_df[violations_df['Parameter'] == worst_param].shape[0]
+            st.markdown(f"**Most Frequent Issue:** `{worst_param}` was out of spec **{worst_count} times**.")
+
+            with st.expander("🔎 View Detailed Violation Report", expanded=True):
+                st.dataframe(
+                    violations_df.sort_values(['Parameter', 'Date']), 
+                    use_container_width=True,
+                    hide_index=True
+                )
+        else:
+            st.success("✅ Excellent! All parameters are within control limits.")
+
+        # 3. Data Quality Section
+        with st.expander("🛠 Data Quality Checks"):
+            if quality['date_gaps']:
+                st.warning(f"Missing Dates: {', '.join([str(d) for d in quality['date_gaps']])}")
             else:
-                st.success("✅ All parameter data is complete.")
+                st.write("Dates are continuous.")
+                
+            if quality['missing_values']:
+                st.warning("Missing Values found in: " + ", ".join([f"{k} ({v})" for k,v in quality['missing_values'].items()]))
+            else:
+                st.write("No missing data values.")
 
         st.divider()
-
-        # 3. Generate Report
-        if st.button("Generate & Download PDF Report", type="primary"):
-            with st.spinner('Plotting graphs...'):
+        
+        # 4. Generate PDF Button
+        if st.button("📄 Generate & Download PDF", type="primary"):
+            with st.spinner('Rendering Graphs...'):
                 pdf_path = generate_pdf(df, limits)
-                
                 if pdf_path:
                     with open(pdf_path, "rb") as f:
-                        pdf_bytes = f.read()
-                        
-                    st.success("✅ Report Generated Successfully!")
-                    st.download_button(
-                        label="📥 Click here to Download PDF",
-                        data=pdf_bytes,
-                        file_name="MEE_Final_Report.pdf",
-                        mime="application/pdf"
-                    )
-    elif df is not None and df.empty:
-        st.error("The file was read, but no valid data rows (with dates) were found.")
+                        st.download_button(
+                            label="📥 Download Final Report",
+                            data=f.read(),
+                            file_name="Smart_CT_Report.pdf",
+                            mime="application/pdf"
+                        )
+                    st.success("Report ready for download!")
